@@ -13,14 +13,20 @@ services:
 install:
   - go get github.com/BurntSushi/toml
   - go get github.com/pkg/errors
-  - go get -u github.com/alecthomas/gometalinter
-  - gometalinter --install
+  - go get -u github.com/golang/lint/golint
+  - go get -u github.com/mdempsky/unconvert
+  - go get -u github.com/gordonklaus/ineffassign
+  - go get -u honnef.co/go/tools/cmd/gosimple
+  - go get -u honnef.co/go/tools/cmd/staticcheck
 
 script:
-  - gometalinter --vendor --disable-all --enable=gosimple --enable=golint --enable=vet --enable=ineffassign --enable=unconvert \
-    --exclude="by other packages, and that stutters; consider calling this" \
-    --skip=proto \
-    --skip=vendor \
-    --skip=.git \
-    --tests ./...
-  - go test -run=TestProxy ./...
+  - find . ! \( -path './vendor' -prune \) -type f -name '*.go' -print0 | xargs -0 gofmt -l -s
+  - golint ./...
+  - unconvert $(go list ./... | grep -v /vendor/)
+  - ineffassign .
+  - gosimple -ignore "$(cat .gosimpleignore)" $(go list ./... | grep -v /vendor/)
+  - staticcheck $(go list ./... | grep -v /vendor/)
+  - cd proxy
+  - go test -run=TestProxy
+  - cd ../cmd/proxy
+  - go build
