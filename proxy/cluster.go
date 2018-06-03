@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	errs "errors"
+	"hash/crc32"
 	"net"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 
 const (
 	hashRingSpots = 255
+	MaxSlots      = 16384
 )
 
 // cluster errors
@@ -73,6 +75,9 @@ type Cluster struct {
 	nodeAlias map[string]string
 	nodePing  map[string]*pinger
 	nodeCh    map[string]*channel
+	// redis luster
+	redirectCh map[string]*channel // cluster move,ask redirect chan.
+	slots      map[uint32]string   // pre-hash slots
 
 	lock   sync.Mutex
 	closed bool
@@ -90,16 +95,11 @@ func NewCluster(ctx context.Context, cc *ClusterConfig) (c *Cluster) {
 	if len(cc.HashTag) == 2 {
 		c.hashTag = []byte{cc.HashTag[0], cc.HashTag[1]}
 	}
-	ring := ketama.NewRing(hashRingSpots)
-	if alias {
-		ring.Init(ans, ws)
-	} else {
-		ring.Init(addrs, ws)
-	}
 	nm := map[string]*pool.Pool{}
 	am := map[string]string{}
 	pm := map[string]*pinger{}
 	cm := map[string]*channel{}
+	dm := map[string]*channel{}
 	// for addrs
 	for i := range addrs {
 		node := addrs[i]
@@ -112,6 +112,23 @@ func NewCluster(ctx context.Context, cc *ClusterConfig) (c *Cluster) {
 		rc := newChannel(int32(cc.PoolActive))
 		cm[node] = rc
 		go c.process(node, rc)
+		if cc.CacheType == proto.CacheTypeRedisCluster {
+			dc := newChannel(1)
+			dm[node] = dc
+			go c.process(node, dc)
+		}
+	}
+	ring := ketama.NewRing(hashRingSpots)
+	if cc.CacheType == proto.CacheTypeRedisCluster {
+		c.slots = make(map[uint32]string, MaxSlots)
+		c.redirectCh = dm
+		c.updateSlots()
+	} else {
+		if alias {
+			ring.Init(ans, ws)
+		} else {
+			ring.Init(addrs, ws)
+		}
 	}
 	c.ring = ring
 	c.alias = alias
@@ -170,6 +187,7 @@ func (c *Cluster) process(node string, rc *channel) {
 				}
 				now := time.Now()
 				resp, err := hdl.Handle(req)
+				// TODO: move or ask  resp set back to redirect chan
 				stat.HandleTime(c.cc.Name, node, req.Cmd(), int64(time.Since(now)/time.Microsecond))
 				if err != nil {
 					c.put(node, hdl, err)
@@ -200,7 +218,12 @@ func (c *Cluster) hash(key []byte) (node string, ok bool) {
 	if len(realKey) == 0 {
 		realKey = key
 	}
-	node, ok = c.ring.Hash(realKey)
+	if c.cc.CacheType == proto.CacheTypeRedisCluster {
+		slot := crc32.ChecksumIEEE(realKey) % MaxSlots
+		node, ok = c.slots[slot]
+	} else {
+		node, ok = c.ring.Hash(realKey)
+	}
 	return
 }
 
@@ -280,6 +303,21 @@ func (c *Cluster) keepAlive() {
 	}
 }
 
+func (c *Cluster) updateSlots() {
+	for _, node := range c.cc.Servers {
+		h, err := c.get(node)
+		if err != nil {
+			return
+		}
+		req := &proto.Request{}
+		// TODO: set redis proto `cluster slots`
+		resp, err := h.Handle(req)
+		if err != nil {
+			return
+		}
+		_ = resp
+	}
+}
 func parseServers(svrs []string) (addrs []string, ws []int, ans []string, alias bool, err error) {
 	for _, svr := range svrs {
 		if strings.Contains(svr, " ") {
